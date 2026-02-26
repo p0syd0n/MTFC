@@ -3,7 +3,7 @@ use std::io::prelude::*;
 use std::path::Path;
 use std::collections::HashMap;
 
-const DEPTH: u8 = 3;
+const DEPTH: u8 = 5;
 const TREE_COUNT: u8 = 100;
 const LEARNING_RATE: f32 = 0.05;
 
@@ -30,7 +30,7 @@ fn main() {
     println!("Hello, world!");
     
     // Open the data file
-    let path = Path::new("data_small.xls");
+    let path = Path::new("BTCUSDT_TRAIN.xls");
     let mut file = match File::open(&path) {
         Err(reason) => panic!("Panic opening training file: {}", reason),
         Ok(file) => file,
@@ -122,7 +122,7 @@ fn main() {
 }
 
 fn test(nodes: Vec<Node>, initial_prediction: f32) {
-    let path = Path::new("test.xls");
+    let path = Path::new("BTC_USDT_TEST.xls");
     let mut file = match File::open(&path) {
         Err(reason) => panic!("Panicked opening test file: {}", reason),
         Ok(file) => file,
@@ -207,7 +207,7 @@ fn test(nodes: Vec<Node>, initial_prediction: f32) {
         }
 
     }
-    println!("{} correct, {} incorrect, {}%correct", correct, incorrect, correct as f32 / ((correct as f32)+(incorrect as f32)));
+    println!("{} correct, {} incorrect, {}%correct", correct, incorrect, 100.0* correct as f32 / ((correct as f32)+(incorrect as f32)));
 }
 
 fn generate_tree(decision: &mut Node, data: &[&Period], current_depth: u8) {
@@ -220,6 +220,7 @@ fn generate_tree(decision: &mut Node, data: &[&Period], current_depth: u8) {
         *decision = Node::Leaf { probability: data[0].residual };
         return;
     }
+
     if let Node::Decision { indicator, threshold, left, right } = decision {
     
         let columns = data[0].data.keys();
@@ -229,6 +230,7 @@ fn generate_tree(decision: &mut Node, data: &[&Period], current_depth: u8) {
 
         let mut ideal_left_mean_per_column: f32 = 0.0;
         let mut ideal_right_mean_per_column: f32 = 0.0;
+
         for column in columns {
             for _i in 0..current_depth {
                 print!("    ");
@@ -318,6 +320,7 @@ fn generate_tree(decision: &mut Node, data: &[&Period], current_depth: u8) {
         println!("The ideal variance column was {}", ideal_column);
         *indicator = ideal_column.clone();
         *threshold = ideal_split_per_column;
+        
         if current_depth + 1 == DEPTH {
             *left = Some(Box::new(Node::Leaf { probability: ideal_left_mean_per_column }));
             *right = Some(Box::new(Node::Leaf { probability: ideal_right_mean_per_column }));
