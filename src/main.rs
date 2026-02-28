@@ -1,16 +1,23 @@
+mod logger;
+
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
 use std::collections::HashMap;
 
 const DEPTH: u8 = 3;
-const TREE_COUNT: u8 = 100;
-const LEARNING_RATE: f32 = 0.05;
+const TREE_COUNT: u8 = 30;
+const LEARNING_RATE: f32 = 0.08;
+const TRAIN_FILE: &str = "data_small.csv";
+const TEST_FILE: &str = "test.csv";
+const GRAPHICAL: bool = true;
+const LOG_FILE: &str = "training_log.json";
 
 struct Period {
     data: HashMap<String, f32>,
     label: bool,
     residual: f32,
+    current_prediction: f32
 }
 
 #[derive(Debug)]
@@ -55,18 +62,19 @@ fn load_data(filename: String) -> (Vec<Period>, f32) {
     let mut total_sells: u32 = 0;
     for i in 1..rows.len()-1 {  // Skip header and last row
         // New data point
-        let mut new_period = Period { data: HashMap::new(), label: false, residual: 0.0 };
+        let mut new_period = Period { data: HashMap::new(), label: false, residual: 0.0, current_prediction: 0.0 };
         
         // Get current row's features
         let column_data: Vec<_> = rows[i].split(",").map(|item| item.trim()).collect();
         for (index, column_data_point) in column_data.iter().enumerate() {
+            // println!("{}", column_data_point);
             new_period.data.insert(columns[index].to_string(), column_data_point.parse::<f32>().unwrap());
         }
         
         // Get NEXT row's open and close to set label
         let next_row_data: Vec<_> = rows[i+1].split(",").map(|item| item.trim()).collect();
-        let next_open: f32 = next_row_data[columns.iter().position(|&c| c == "open").unwrap()].parse().unwrap();
-        let next_close: f32 = next_row_data[columns.iter().position(|&c| c == "close").unwrap()].parse().unwrap();
+        let next_open: f32 = next_row_data[columns.iter().position(|&c| c.to_lowercase() == "open").unwrap()].parse().unwrap();
+        let next_close: f32 = next_row_data[columns.iter().position(|&c| c.to_lowercase() == "close").unwrap()].parse().unwrap();
         
         // Label based on next period
         let label: bool;
@@ -84,6 +92,7 @@ fn load_data(filename: String) -> (Vec<Period>, f32) {
     let initial_prediction = total_buys as f32/(total_sells+total_buys) as f32;
 
     for period in &mut data_points {
+        period.current_prediction = initial_prediction;
         period.residual = period.label as i32 as f32 - initial_prediction;
     }
     (data_points, initial_prediction)
@@ -92,8 +101,9 @@ fn load_data(filename: String) -> (Vec<Period>, f32) {
 fn main() {
     println!("Hello, world!");
     
-    let (mut data_points, initial_prediction) = load_data("data_small.csv".to_string());
+    let (mut data_points, initial_prediction) = load_data(TRAIN_FILE.to_string());
 
+    logger::init_log(initial_prediction);
 
     let mut trees: Vec<Node> = Vec::new();
 
@@ -111,7 +121,9 @@ fn main() {
 
                 match current {
                     Node::Leaf { probability } => {
-                        period.residual += LEARNING_RATE * probability;
+                        period.current_prediction += LEARNING_RATE * probability;
+                        period.residual = period.label as i32 as f32 - period.current_prediction;
+                        // period.residual += LEARNING_RATE * probability;
                         break;
                     }
                     Node::Decision { indicator, threshold, left, right } => {
@@ -126,6 +138,9 @@ fn main() {
                 }
             }
         }
+
+        logger::log_tree_step(i, &new_tree, &data_points);
+
         trees.push(new_tree);
     }
 
@@ -133,12 +148,12 @@ fn main() {
 }
 
 fn test(nodes: Vec<Node>, initial_prediction: f32) {
-    let (mut data_points, initial_prediction) = load_data("test.csv".to_string());
+    let (mut data_points, initial_prediction) = load_data(TEST_FILE.to_string());
     
     let mut correct: u32 = 0;
     let mut incorrect: u32 = 0;
 
-    for data_point in data_points {
+    for mut data_point in data_points {
         let mut prediction = initial_prediction;
         for tree in &nodes {  // Borrow, don't move
             let mut current = tree;
@@ -152,7 +167,9 @@ fn test(nodes: Vec<Node>, initial_prediction: f32) {
                         }
                     },
                     Node::Leaf { probability } => {
-                        prediction += LEARNING_RATE * probability;
+                        data_point.current_prediction += LEARNING_RATE * probability;
+                        data_point.residual = data_point.label as i32 as f32 - data_point.current_prediction;
+                        //prediction += LEARNING_RATE * probability;
                         break;
                     }
                 };
@@ -160,7 +177,7 @@ fn test(nodes: Vec<Node>, initial_prediction: f32) {
         }
 
         // Now check if prediction > 0.5 matches data_point.label
-        if (prediction > 0.5 && data_point.label) || (prediction <= 0.5 && !data_point.label) {
+        if (data_point.current_prediction > 0.5 && data_point.label) || (data_point.current_prediction <= 0.5 && !data_point.label) {
             correct += 1;
         } else {
             incorrect += 1;
@@ -168,6 +185,8 @@ fn test(nodes: Vec<Node>, initial_prediction: f32) {
 
     }
     println!("{} correct, {} incorrect, {}%correct", correct, incorrect, 100.0* correct as f32 / ((correct as f32)+(incorrect as f32)));
+
+    logger::log_test_result(correct, incorrect);
 }
 
 // Going into here, we have a decision node to set maybe call generate_tree again
@@ -176,7 +195,7 @@ fn generate_tree(data: &[&Period], current_depth: u8) -> Node {
     //     print!("    ");
     // }
     // println!("Generate_tree has been called");
-    println!("The size of the datset passed was {}", data.len());
+    //println!("The size of the datset passed was {}", data.len());
     if data.len() == 1 as usize {  // Minimum leaf size
         return  Node::Leaf { probability: data[0].residual };
     }
@@ -205,6 +224,7 @@ fn generate_tree(data: &[&Period], current_depth: u8) -> Node {
             // println!("Sifting through column {}", column);
 
             let mut sorted_data: Vec<&Period> = data.iter().copied().collect();
+            // println!("Attempting to get column named {}", column);
             sorted_data.sort_by(|a, b| 
                 a.data.get(column).unwrap()
                 .partial_cmp(b.data.get(column).unwrap())
@@ -281,18 +301,18 @@ fn generate_tree(data: &[&Period], current_depth: u8) -> Node {
                 ideal_right_mean_per_column = ideal_right_mean;
             }
         }
-        for _i in 0..current_depth {
-           print!("    ");
-        }
-        println!("The ideal variance column was '{}', with threshold {}", ideal_column, ideal_split_per_column);
+        // for _i in 0..current_depth {
+        //    print!("    ");
+        // }
+        //println!("The ideal variance column was '{}', with threshold {}", ideal_column, ideal_split_per_column);
         let indicator: String = ideal_column.clone();
         let threshold: f32 = ideal_split_per_column;
         
         if current_depth == DEPTH {
-            for _i in 0..current_depth {
-            print!("    ");
-            }
-            println!("Returning because we are about to hit depth");
+            // for _i in 0..current_depth {
+            // print!("    ");
+            // }
+            //  println!("Returning because we are about to hit depth");
             return Node::Decision {
                 indicator: indicator,
                 threshold: threshold,
@@ -315,12 +335,12 @@ fn generate_tree(data: &[&Period], current_depth: u8) -> Node {
             .collect();
         
         if left_data.len() < 1 || right_data.len() < 1 {
-            for _i in 0..current_depth {
-              print!("    ");
-            }
-            println!("Somehow, one is empty but the indicator did not fire. THis means that the boudnary was right at the edge. ");
-            println!("creating a leaf - no split is optimal.");
-            println!("leaf");
+            // for _i in 0..current_depth {
+            //   print!("    ");
+            // }
+            //println!("Somehow, one is empty but the indicator did not fire. THis means that the boudnary was right at the edge. ");
+            //println!("creating a leaf - no split is optimal.");
+            //println!("leaf");
             // Calculate the mean of all data as the leaf value
             let mean_residual = data.iter()
                 .map(|dp| dp.residual)
