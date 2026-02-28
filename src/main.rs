@@ -3,7 +3,7 @@ use std::io::prelude::*;
 use std::path::Path;
 use std::collections::HashMap;
 
-const DEPTH: u8 = 5;
+const DEPTH: u8 = 3;
 const TREE_COUNT: u8 = 100;
 const LEARNING_RATE: f32 = 0.05;
 
@@ -26,11 +26,10 @@ enum Node {
     },
 }
 
-fn main() {
-    println!("Hello, world!");
-    
+
+fn load_data(filename: String) -> String {
     // Open the data file
-    let path = Path::new("BTCUSDT_TRAIN.xls");
+    let path = Path::new(&filename);
     let mut file = match File::open(&path) {
         Err(reason) => panic!("Panic opening training file: {}", reason),
         Ok(file) => file,
@@ -41,6 +40,14 @@ fn main() {
         Err(reason) => panic!("Panic reading from training file: {}", reason),
         Ok(bytes) => println!("Read {} bytes of data", bytes),
     };
+    data
+}
+
+fn main() {
+    println!("Hello, world!");
+    
+    let data: String = load_data("data_small.csv".to_string());
+
     // Split the data into lines, filtering out empty lines
     let rows: Vec<_> = data.split("\n").filter(|line| !line.is_empty()).collect();
     // The first row - the column titles. Derived here so that I can index this in the loop to get the column titles without deriving over and over
@@ -90,7 +97,7 @@ fn main() {
         println!("Generating tree {}", i);
         let mut new_tree = Node::Decision { indicator: String::new(), threshold: 0.0, left: None, right: None};
         generate_tree(&mut new_tree, &data_points.iter().collect::<Vec<_>>(), 0);
-        println!("Updating residuals from tree {}", i);
+        //  println!("Updating residuals from tree {}", i);
         
 
         for period in &mut data_points {
@@ -100,7 +107,7 @@ fn main() {
 
                 match current {
                     Node::Leaf { probability } => {
-                        period.residual -= LEARNING_RATE * probability;
+                        period.residual += LEARNING_RATE * probability;
                         break;
                     }
                     Node::Decision { indicator, threshold, left, right } => {
@@ -122,22 +129,15 @@ fn main() {
 }
 
 fn test(nodes: Vec<Node>, initial_prediction: f32) {
-    let path = Path::new("BTC_USDT_TEST.xls");
-    let mut file = match File::open(&path) {
-        Err(reason) => panic!("Panicked opening test file: {}", reason),
-        Ok(file) => file,
-    };
-
-    let mut data = String::new();
-    match file.read_to_string(&mut data) {
-        Err(reason) => panic!("Panicked reading test file: {}", reason),
-        Ok(bytes) => println!("Read {} bytes from test file", bytes),
-    };
+    let data: String = load_data("test.csv".to_string());
     // Split the data into lines, filtering out empty lines
     let rows: Vec<_> = data.split("\n").filter(|line| !line.is_empty()).collect();
     // The first row - the column titles. Derived here so that I can index this in the loop to get the column titles without deriving over and over
     let columns: Vec<&str> = rows[0].split(",").collect();
     let mut data_points: Vec<Period> = Vec::new();
+
+    // -> count total buys, sells; parses data string to Vec<Period> (and sets correct labels)
+    // Todo: use a dynamic array, not a hashmap indexed by strings for the data: Hashmap<String, f32> in Period
 
     // Skip one because the first row is column titles
     let mut total_buys: u32 = 0;
@@ -210,12 +210,13 @@ fn test(nodes: Vec<Node>, initial_prediction: f32) {
     println!("{} correct, {} incorrect, {}%correct", correct, incorrect, 100.0* correct as f32 / ((correct as f32)+(incorrect as f32)));
 }
 
+// Going into here, we have a decision node to set maybe call generate_tree again
 fn generate_tree(decision: &mut Node, data: &[&Period], current_depth: u8) {
-    for _i in 0..current_depth {
-        print!("    ");
-    }
-    println!("Generate_tree has been called");
-    println!("The size of the datset passed was {}", data.len());
+    // for _i in 0..current_depth {
+    //     print!("    ");
+    // }
+    // println!("Generate_tree has been called");
+    // println!("The size of the datset passed was {}", data.len());
     if data.len() == 1 {  // Minimum leaf size
         *decision = Node::Leaf { probability: data[0].residual };
         return;
@@ -223,6 +224,12 @@ fn generate_tree(decision: &mut Node, data: &[&Period], current_depth: u8) {
 
     if let Node::Decision { indicator, threshold, left, right } = decision {
     
+        // *decision = Node::Decision { indicator, threshold, left, right };
+        // let mut indicator = decision.indicator;
+        // let mut threshold =  decision.threshold;
+        // let mut left  =  decision.left;
+        // let mut  right = decision.right;
+        
         let columns = data[0].data.keys();
         let mut min_variance_per_column = 100000.0;
         let mut ideal_split_per_column = 0.0;
@@ -232,10 +239,10 @@ fn generate_tree(decision: &mut Node, data: &[&Period], current_depth: u8) {
         let mut ideal_right_mean_per_column: f32 = 0.0;
 
         for column in columns {
-            for _i in 0..current_depth {
-                print!("    ");
-            }
-            println!("Sifting through column {}", column);
+            // for _i in 0..current_depth {
+            //     print!("  ");
+            // }
+            // println!("Sifting through column {}", column);
 
             let mut sorted_data: Vec<&Period> = data.iter().copied().collect();
             sorted_data.sort_by(|a, b| 
@@ -254,8 +261,8 @@ fn generate_tree(decision: &mut Node, data: &[&Period], current_depth: u8) {
             let mut running_residual_square_left: f32 = 0.0;
             let mut running_residual_square_right: f32 = sorted_data.iter().map(|dp| dp.residual * dp.residual).sum();
 
-
-            for i in 0..sorted_data.len() - 1 {
+            let mut sorted_data_len: usize = sorted_data.len();
+            for i in 0..sorted_data_len - 1 {
                 let data_point = sorted_data[i];
                 
                 running_residual_left += data_point.residual;
@@ -265,14 +272,14 @@ fn generate_tree(decision: &mut Node, data: &[&Period], current_depth: u8) {
                 running_residual_square_right -= data_point.residual * data_point.residual;
 
                 let left_count = (i + 1) as f32;
-                let right_count = (sorted_data.len() - i - 1) as f32;
+                let right_count = (sorted_data_len - i - 1) as f32;
                 
                 let mean_left = running_residual_left / left_count;
                 let mean_right = running_residual_right / right_count;
 
                 let variance_left = (running_residual_square_left / left_count) - (mean_left * mean_left);
                 let variance_right = (running_residual_square_right / right_count) - (mean_right * mean_right);
-                let total_variance = (left_count * variance_left + right_count * variance_right) / sorted_data.len() as f32;                
+                let total_variance = (left_count * variance_left + right_count * variance_right) / sorted_data_len as f32;                
                 // println!("Total variance:{}", total_variance);
                 
                 if total_variance < min_variance {
@@ -314,10 +321,10 @@ fn generate_tree(decision: &mut Node, data: &[&Period], current_depth: u8) {
                 ideal_right_mean_per_column = ideal_right_mean;
             }
         }
-        for _i in 0..current_depth {
-            print!("    ");
-        }
-        println!("The ideal variance column was {}", ideal_column);
+        // for _i in 0..current_depth {
+        //    // print!("    ");
+        // }
+        // println!("The ideal variance column was {}, with threshold {}", ideal_column, ideal_split_per_column);
         *indicator = ideal_column.clone();
         *threshold = ideal_split_per_column;
         
@@ -339,11 +346,12 @@ fn generate_tree(decision: &mut Node, data: &[&Period], current_depth: u8) {
             .collect();
         
         if left_data.len() <= 1 || right_data.len() <= 1 {
-            for _i in 0..current_depth {
-                print!("    ");
-            }
-            println!("Somehow, one is empty but the indicator did not fire. THis means that the boudnary was right at the edge. ");
-            println!("creating a leaf - no split is optimal.");
+            // for _i in 0..current_depth {
+            //   //  print!("    ");
+            // }
+            // println!("Somehow, one is empty but the indicator did not fire. THis means that the boudnary was right at the edge. ");
+            // println!("creating a leaf - no split is optimal.");
+       //     println!("leaf");
             // Calculate the mean of all data as the leaf value
             let mean_residual = data.iter()
                 .map(|dp| dp.residual)
@@ -359,6 +367,6 @@ fn generate_tree(decision: &mut Node, data: &[&Period], current_depth: u8) {
         generate_tree(&mut (*left).as_mut().unwrap(), &left_data, current_depth+1);
         generate_tree(&mut (*right).as_mut().unwrap(), &right_data, current_depth+1);
 
+    
     }
-
 }
