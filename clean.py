@@ -1,41 +1,61 @@
-def clean(filename):
-    with open(filename, "r") as file:
-        data = file.read()
-        lines = data.split("\n")
-        lines = [line for line in lines if len(line) != 0]
+def clean(filename, blacklist=None):
+    if blacklist is None:
+        blacklist = []
+    
+    # Normalize blacklist to lowercase for case-insensitive matching
+    blacklist = [item.lower().strip() for item in blacklist]
 
-    columns = lines[0].split(",")
-    del lines[0]
+    with open(filename, "r") as file:
+        lines = [line.strip() for line in file if line.strip()]
+
+    if not lines:
+        return
+
+    all_columns = [col.strip() for col in lines[0].split(",")]
+    data_rows = lines[1:]
+
+    # 1. Identify indices that are NOT in the blacklist
+    valid_indices = [
+        i for i, col in enumerate(all_columns) 
+        if col.lower() not in blacklist
+    ]
 
     new_lines = []
     numeric_indices = None
 
-    for line in lines:
-        fields = line.split(",")
+    for line in data_rows:
+        fields = [f.strip() for f in line.split(",")]
+        
+        # Ensure we don't crash on rows with fewer columns than the header
+        if len(fields) < len(all_columns):
+            continue
 
-        # On the first row, determine which columns are numeric
+        # 2. On the first valid row, further filter for numeric-only columns
         if numeric_indices is None:
             numeric_indices = []
-            for i, field in enumerate(fields):
+            for i in valid_indices:
                 try:
-                    float(field.strip())
+                    float(fields[i])
                     numeric_indices.append(i)
                 except ValueError:
-                    pass
+                    continue
 
-        # Skip lines with missing data
-        if any(fields[i].strip() == "" for i in numeric_indices):
+        # 3. Skip lines with missing data in the target numeric columns
+        if any(fields[i] == "" for i in numeric_indices):
             print(f"Skipping incomplete line: {line}")
             continue
 
+        # Extract only the allowed numeric fields
         new_lines.append(",".join(fields[i] for i in numeric_indices))
 
-    columns = [columns[i] for i in numeric_indices]
+    # Update columns to match the final selection
+    final_columns = [all_columns[i] for i in numeric_indices]
 
+    # 4. Write back to file
     with open(filename, "w") as file:
-        end_content = ",".join(columns) + "\n"
-        for new_line in new_lines:
-            end_content += new_line + "\n"
-        file.write(end_content)
+        file.write(",".join(final_columns) + "\n")
+        file.write("\n".join(new_lines) + "\n")
 
-clean("jpm_test.csv")
+# Usage
+blacklist_cols = ["close_forcast"]
+clean("g_train.csv", blacklist=blacklist_cols)

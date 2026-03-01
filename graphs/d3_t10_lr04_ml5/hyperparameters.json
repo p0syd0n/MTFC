@@ -1,0 +1,14 @@
+{
+  "depth": 3,
+  "tree_count": 10,
+  "learning_rate": 0.04,
+  "min_leaf_size": 5,
+  "initial_pred": 0.53552926,
+  "train_file": "data_small.csv",
+  "test_file": "test.csv",
+  "log_file": "training_log.json",
+  "output_folder": "graphs/d3_t10_lr04_ml5/",
+  "test_accuracy": 60.78334,
+  "test_correct": 3678,
+  "test_incorrect": 2373
+}

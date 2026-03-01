@@ -1,0 +1,14 @@
+{
+  "depth": 5,
+  "tree_count": 100,
+  "learning_rate": 0.04,
+  "min_leaf_size": 10,
+  "initial_pred": 0.5176292,
+  "train_file": "jpm_train.csv",
+  "test_file": "jpm_test.csv",
+  "log_file": "training_log.json",
+  "output_folder": "graphs/d5_t100_lr04_ml10/",
+  "test_accuracy": 50.884434,
+  "test_correct": 863,
+  "test_incorrect": 833
+}

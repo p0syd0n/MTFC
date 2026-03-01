@@ -6,12 +6,13 @@ use std::path::Path;
 use std::collections::HashMap;
 
 const DEPTH: u8 = 3;
-const TREE_COUNT: u8 = 30;
-const LEARNING_RATE: f32 = 0.08;
-const TRAIN_FILE: &str = "data_small.csv";
-const TEST_FILE: &str = "test.csv";
+const TREE_COUNT: u8 = 46;
+const LEARNING_RATE: f32 = 0.04;
+const TRAIN_FILE: &str = "synthetic_train.csv";
+const TEST_FILE: &str = "synthetic_test.csv";
 const GRAPHICAL: bool = true;
 const LOG_FILE: &str = "training_log.json";
+const MIN_LEAF_SIZE: usize = 5;
 
 struct Period {
     data: HashMap<String, f32>,
@@ -109,7 +110,7 @@ fn main() {
 
     for i in 0..TREE_COUNT {
         println!("Generating tree {}", i);
-        let mut new_tree = generate_tree(&data_points.iter().collect::<Vec<_>>(), 0);
+        let new_tree = generate_tree(&data_points.iter().collect::<Vec<_>>(), 0);
         
         //  println!("Updating residuals from tree {}", i);
         
@@ -144,17 +145,19 @@ fn main() {
         trees.push(new_tree);
     }
 
-    test(trees, initial_prediction);
+    test(trees);
 }
 
-fn test(nodes: Vec<Node>, initial_prediction: f32) {
-    let (mut data_points, initial_prediction) = load_data(TEST_FILE.to_string());
+fn test(nodes: Vec<Node>) {
+    let (data_points, _initial_prediction) = load_data(TEST_FILE.to_string());
     
     let mut correct: u32 = 0;
     let mut incorrect: u32 = 0;
 
+    // Collect (prediction, label) for every test period in order
+    let mut backtest_results: Vec<(f32, bool)> = Vec::new();
+
     for mut data_point in data_points {
-        let mut prediction = initial_prediction;
         for tree in &nodes {  // Borrow, don't move
             let mut current = tree;
             loop {
@@ -176,6 +179,8 @@ fn test(nodes: Vec<Node>, initial_prediction: f32) {
             }
         }
 
+        backtest_results.push((data_point.current_prediction, data_point.label));
+
         // Now check if prediction > 0.5 matches data_point.label
         if (data_point.current_prediction > 0.5 && data_point.label) || (data_point.current_prediction <= 0.5 && !data_point.label) {
             correct += 1;
@@ -187,6 +192,7 @@ fn test(nodes: Vec<Node>, initial_prediction: f32) {
     println!("{} correct, {} incorrect, {}%correct", correct, incorrect, 100.0* correct as f32 / ((correct as f32)+(incorrect as f32)));
 
     logger::log_test_result(correct, incorrect);
+    logger::log_backtest_results(&backtest_results);
 }
 
 // Going into here, we have a decision node to set maybe call generate_tree again
@@ -196,169 +202,137 @@ fn generate_tree(data: &[&Period], current_depth: u8) -> Node {
     // }
     // println!("Generate_tree has been called");
     //println!("The size of the datset passed was {}", data.len());
-    if data.len() == 1 as usize {  // Minimum leaf size
-        return  Node::Leaf { probability: data[0].residual };
+    if data.len() <= MIN_LEAF_SIZE {  // Minimum leaf size
+        return Node::Leaf { probability: data.iter().map(|&dp| dp.residual).collect::<Vec<f32>>().into_iter().sum::<f32>()/(MIN_LEAF_SIZE as f32) };
     }
-    //println!("Blew right past the check");
 
-   // if let Node::Decision { indicator, threshold, left, right } = decision {
-    
-        // *decision = Node::Decision { indicator, threshold, left, right };
-        // let mut indicator = decision.indicator;
-        // let mut threshold =  decision.threshold;
-        // let mut left  =  decision.left;
-        // let mut  right = decision.right;
-        
-        let columns = data[0].data.keys();
-        let mut min_variance_per_column = 100000.0;
-        let mut ideal_split_per_column = 0.0;
-        let mut ideal_column = String::new();
+    let columns = data[0].data.keys();
+    let mut min_variance_per_column = 100000.0;
+    let mut ideal_split_per_column = 0.0;
+    let mut ideal_column = String::new();
 
-        let mut ideal_left_mean_per_column: f32 = 0.0;
-        let mut ideal_right_mean_per_column: f32 = 0.0;
+    let mut ideal_left_mean_per_column: f32 = 0.0;
+    let mut ideal_right_mean_per_column: f32 = 0.0;
 
-        for column in columns {
-            // for _i in 0..current_depth {
-            //     print!("  ");
-            // }
-            // println!("Sifting through column {}", column);
-
-            let mut sorted_data: Vec<&Period> = data.iter().copied().collect();
-            // println!("Attempting to get column named {}", column);
-            sorted_data.sort_by(|a, b| 
-                a.data.get(column).unwrap()
-                .partial_cmp(b.data.get(column).unwrap())
-                .unwrap()
-            );
-            let mut min_variance: f32 = 1000000.0; // Large number, make sure it gets set in the first iteration
-            let mut ideal_split: f32 = 0.0;
-            let mut ideal_left_mean: f32 = 0.0;
-            let mut ideal_right_mean: f32 = 0.0;
-
-            let mut running_residual_left: f32 = 0.0;
-            let mut running_residual_right: f32 = sorted_data.iter().map(|dp| dp.residual).sum();
-
-            let mut running_residual_square_left: f32 = 0.0;
-            let mut running_residual_square_right: f32 = sorted_data.iter().map(|dp| dp.residual * dp.residual).sum();
-
-            let mut sorted_data_len: usize = sorted_data.len();
-            for i in 0..sorted_data_len - 1 {
-                let data_point = sorted_data[i];
-                
-                running_residual_left += data_point.residual;
-                running_residual_right -= data_point.residual;
-
-                running_residual_square_left += data_point.residual * data_point.residual;
-                running_residual_square_right -= data_point.residual * data_point.residual;
-
-                let left_count = (i + 1) as f32;
-                let right_count = (sorted_data_len - i - 1) as f32;
-                
-                let mean_left = running_residual_left / left_count;
-                let mean_right = running_residual_right / right_count;
-
-                let variance_left = (running_residual_square_left / left_count) - (mean_left * mean_left);
-                let variance_right = (running_residual_square_right / right_count) - (mean_right * mean_right);
-                let total_variance = (left_count * variance_left + right_count * variance_right) / sorted_data_len as f32;                
-                // println!("Total variance:{}", total_variance);
-                
-                if total_variance < min_variance {
-                    min_variance = total_variance;
-                    ideal_split = (sorted_data[i].data.get(column).unwrap() + sorted_data[i+1].data.get(column).unwrap()) / 2.0;
-                    ideal_left_mean = mean_left;
-                    ideal_right_mean = mean_right;
-                }
-            }
-
-            /*
-            for i in 0..sorted_data.len() - 1 {
-                //println!("Looking for variance when the split (by {}) is at {}", column, sorted_data[i].data.get(column).unwrap()+1.0);
-                let left_side = &sorted_data[..i+1];     // First i+1 elements
-                let right_side = &sorted_data[i+1..];    // Remaining elements
-                
-                let left_side_mean: f32 = left_side.iter().map(|dp| dp.residual).sum::<f32>() / left_side.len() as f32;
-                let right_side_mean: f32 = right_side.iter().map(|dp| dp.residual).sum::<f32>() / right_side.len() as f32;
-
-                let left_side_variance: f32 = left_side.iter().map(|dp| (dp.residual-left_side_mean).powf(2.0)).sum::<f32>() as f32 / left_side.len() as f32;
-                let right_side_variance: f32 = right_side.iter().map(|dp| (dp.residual-right_side_mean).powf(2.0)).sum::<f32>() as f32 / right_side.len() as f32;
-                let total_variance: f32 = (left_side.len() as f32 * left_side_variance + right_side.len() as f32 * right_side_variance) as f32 / sorted_data.len() as f32;
-
-                if min_variance > total_variance {
-                    min_variance = total_variance;
-                    ideal_split = (sorted_data[i].data.get(column).unwrap() + sorted_data[i+1].data.get(column).unwrap()) / 2.0;
-                    ideal_left_mean = left_side_mean;
-                    ideal_right_mean = right_side_mean;
-                }
-            }            
-            */
-
-
-            if min_variance < min_variance_per_column {
-                min_variance_per_column = min_variance;
-                ideal_split_per_column = ideal_split;
-                ideal_column = column.clone();
-                ideal_left_mean_per_column = ideal_left_mean;
-                ideal_right_mean_per_column = ideal_right_mean;
-            }
-        }
+    for column in columns {
         // for _i in 0..current_depth {
-        //    print!("    ");
+        //     print!("  ");
         // }
-        //println!("The ideal variance column was '{}', with threshold {}", ideal_column, ideal_split_per_column);
-        let indicator: String = ideal_column.clone();
-        let threshold: f32 = ideal_split_per_column;
-        
-        if current_depth == DEPTH {
-            // for _i in 0..current_depth {
-            // print!("    ");
-            // }
-            //  println!("Returning because we are about to hit depth");
-            return Node::Decision {
-                indicator: indicator,
-                threshold: threshold,
-                left: Some(Box::new(Node::Leaf { probability: ideal_left_mean_per_column })),
-                right: Some(Box::new(Node::Leaf { probability: ideal_right_mean_per_column }))
-            };
+        // println!("Sifting through column {}", column);
 
-            //return;
-        }
+        let mut sorted_data: Vec<&Period> = data.iter().copied().collect();
+        // println!("Attempting to get column named {}", column);
+        sorted_data.sort_by(|a, b| 
+            a.data.get(column).unwrap()
+            .partial_cmp(b.data.get(column).unwrap())
+            .unwrap()
+        );
+        let mut min_variance: f32 = 1000000.0; // Large number, make sure it gets set in the first iteration
+        let mut ideal_split: f32 = 0.0;
+        let mut ideal_left_mean: f32 = 0.0;
+        let mut ideal_right_mean: f32 = 0.0;
 
+        let mut running_residual_left: f32 = 0.0;
+        let mut running_residual_right: f32 = sorted_data.iter().map(|dp| dp.residual).sum();
 
-        let left_data: Vec<&Period> = data.iter()
-            .copied()
-            .filter(|dp| dp.data.get(&indicator).unwrap() <= &threshold)
-            .collect();
+        let mut running_residual_square_left: f32 = 0.0;
+        let mut running_residual_square_right: f32 = sorted_data.iter().map(|dp| dp.residual * dp.residual).sum();
 
-        let right_data: Vec<&Period> = data.iter()
-            .copied()
-            .filter(|dp| dp.data.get(&indicator).unwrap() > &threshold)
-            .collect();
-        
-        if left_data.len() < 1 || right_data.len() < 1 {
-            // for _i in 0..current_depth {
-            //   print!("    ");
-            // }
-            //println!("Somehow, one is empty but the indicator did not fire. THis means that the boudnary was right at the edge. ");
-            //println!("creating a leaf - no split is optimal.");
-            //println!("leaf");
-            // Calculate the mean of all data as the leaf value
-            let mean_residual = data.iter()
-                .map(|dp| dp.residual)
-                .sum::<f32>() / data.len() as f32;
+        let sorted_data_len: usize = sorted_data.len();
+        // println!("The sorted data len will be {}", sorted_data_len);
+        for i in MIN_LEAF_SIZE..sorted_data_len - 1 {
+            let data_point = sorted_data[i];
             
-            // Replace the current Decision node with a Leaf
-            return Node::Leaf { probability: mean_residual };
-            //return;
+            running_residual_left += data_point.residual;
+            running_residual_right -= data_point.residual;
+
+            running_residual_square_left += data_point.residual * data_point.residual;
+            running_residual_square_right -= data_point.residual * data_point.residual;
+
+            let left_count = (i + 1) as f32;
+            let right_count = (sorted_data_len - i - 1) as f32;
+            
+            let mean_left = running_residual_left / left_count;
+            let mean_right = running_residual_right / right_count;
+
+            let variance_left = (running_residual_square_left / left_count) - (mean_left * mean_left);
+            let variance_right = (running_residual_square_right / right_count) - (mean_right * mean_right);
+            let total_variance = (left_count * variance_left + right_count * variance_right) / sorted_data_len as f32;                
+            // println!("Total variance:{}", total_variance);
+            
+            if total_variance < min_variance {
+                min_variance = total_variance;
+                ideal_split = (sorted_data[i].data.get(column).unwrap() + sorted_data[i+1].data.get(column).unwrap()) / 2.0;
+                ideal_left_mean = mean_left;
+                ideal_right_mean = mean_right;
+            }
         }
 
-        // left = Some(Box::new(Node::Decision { indicator: String::new(), threshold: 0.0, left: None, right: None }));
-        // right = Some(Box::new(Node::Decision { indicator: String::new(), threshold: 0.0, left: None, right: None }));
+        if min_variance < min_variance_per_column {
+            min_variance_per_column = min_variance;
+            ideal_split_per_column = ideal_split;
+            ideal_column = column.clone();
+            ideal_left_mean_per_column = ideal_left_mean;
+            ideal_right_mean_per_column = ideal_right_mean;
+        }
+    }
+    // for _i in 0..current_depth {
+    //    print!("    ");
+    // }
+    // println!("The ideal variance column was '{}', with threshold {}", ideal_column, ideal_split_per_column);
+    let indicator: String = ideal_column.clone();
+    let threshold: f32 = ideal_split_per_column;
+    
+    if current_depth == DEPTH {
+        // for _i in 0..current_depth {
+        // print!("    ");
+        // }
+        //  println!("Returning because we are about to hit depth");
         return Node::Decision {
             indicator: indicator,
             threshold: threshold,
-            left: Some(Box::new(generate_tree(&left_data, current_depth+1))),
-            right: Some(Box::new(generate_tree(&right_data, current_depth+1)))
+            left: Some(Box::new(Node::Leaf { probability: ideal_left_mean_per_column })),
+            right: Some(Box::new(Node::Leaf { probability: ideal_right_mean_per_column }))
         };
+
+        //return;
+    }
+
+
+    let left_data: Vec<&Period> = data.iter()
+        .copied()
+        .filter(|dp| dp.data.get(&indicator).unwrap() <= &threshold)
+        .collect();
+
+    let right_data: Vec<&Period> = data.iter()
+        .copied()
+        .filter(|dp| dp.data.get(&indicator).unwrap() > &threshold)
+        .collect();
+    
+    if left_data.len() < 1 || right_data.len() < 1 {
+        // for _i in 0..current_depth {
+        //   print!("    ");
+        // }
+        //println!("Somehow, one is empty but the indicator did not fire. THis means that the boudnary was right at the edge. ");
+        //println!("creating a leaf - no split is optimal.");
+        //println!("leaf");
+        // Calculate the mean of all data as the leaf value
+        let mean_residual = data.iter()
+            .map(|dp| dp.residual)
+            .sum::<f32>() / data.len() as f32;
         
-        panic!("We should never reach this point?");
+        // Replace the current Decision node with a Leaf
+        return Node::Leaf { probability: mean_residual };
+        //return;
+    }
+
+    // left = Some(Box::new(Node::Decision { indicator: String::new(), threshold: 0.0, left: None, right: None }));
+    // right = Some(Box::new(Node::Decision { indicator: String::new(), threshold: 0.0, left: None, right: None }));
+    return Node::Decision {
+        indicator: indicator,
+        threshold: threshold,
+        left: Some(Box::new(generate_tree(&left_data, current_depth+1))),
+        right: Some(Box::new(generate_tree(&right_data, current_depth+1)))
+    };
+    
 }

@@ -8,6 +8,9 @@ use crate::LOG_FILE;
 use crate::DEPTH;
 use crate::TREE_COUNT;
 use crate::LEARNING_RATE;
+use crate::MIN_LEAF_SIZE;
+use crate::TRAIN_FILE;
+use crate::TEST_FILE;
 
 pub fn node_to_json(node: &Node) -> String {
     match node {
@@ -72,8 +75,23 @@ pub fn init_log(initial_prediction: f32) {
     if !GRAPHICAL { return; }
     let mut f = File::create(LOG_FILE).expect("Could not create log file");
     let entry = format!(
-        "{{\"event\":\"init\",\"depth\":{},\"tree_count\":{},\"learning_rate\":{},\"initial_prediction\":{}}}\n",
-        DEPTH, TREE_COUNT, LEARNING_RATE, initial_prediction
+        "{{\"event\":\"init\",\"depth\":{},\"tree_count\":{},\"learning_rate\":{},\"min_leaf_size\":{},\"initial_prediction\":{},\"train_file\":\"{}\",\"test_file\":\"{}\"}}\n",
+        DEPTH, TREE_COUNT, LEARNING_RATE, MIN_LEAF_SIZE, initial_prediction, TRAIN_FILE, TEST_FILE
     );
     f.write_all(entry.as_bytes()).expect("Could not write init log entry");
+}
+
+// Logs every test period in sequence: prediction score and true label
+pub fn log_backtest_results(results: &[(f32, bool)]) {
+    if !GRAPHICAL { return; }
+    let points: Vec<String> = results
+        .iter()
+        .map(|(pred, label)| format!(r#"{{"p":{},"l":{}}}"#, pred, *label as u8))
+        .collect();
+    let entry = format!(
+        "{{\"event\":\"backtest\",\"points\":[{}]}}\n",
+        points.join(",")
+    );
+    let mut f = open_log_file();
+    f.write_all(entry.as_bytes()).expect("Could not write backtest log entry");
 }

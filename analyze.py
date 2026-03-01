@@ -1,226 +1,298 @@
-"""
-analyze.py  –  Visualise training_log.json produced by the Rust GBM.
-
-Run:
-    pip install matplotlib networkx
-    python analyze.py                          # uses training_log.json by default
-    python analyze.py path/to/training_log.json
-"""
-
 import json
+import os
 import sys
+import math
+import csv
 from collections import Counter
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
+import matplotlib.patches as mpatches
+import matplotlib.ticker as mticker
 import networkx as nx
+import numpy as np
 
-FOLDER = "graphs/"
-# ── Load log ──────────────────────────────────────────────────────────────────
+# Global Config
+BASE_DIR = "graphs/"
+SHOW_TREE_MAPS = False  # Toggle for tree structure diagrams
+CANDLE_WIDTH = 0.55
+WICK_WIDTH = 0.22
 
-log_path = sys.argv[1] if len(sys.argv) > 1 else "training_log.json"
+# Setup paths
+log_file = sys.argv[1] if len(sys.argv) > 1 else "training_log.json"
 
-with open(log_path) as f:
+if not os.path.exists(log_file):
+    print(f"Error: {log_path} not found.")
+    sys.exit(1)
+
+# Parsing events
+with open(log_file) as f:
     events = [json.loads(line) for line in f if line.strip()]
 
-init_event  = next(e for e in events if e["event"] == "init")
-tree_events = [e for e in events if e["event"] == "tree"]
-test_event  = next((e for e in events if e["event"] == "test"), None)
+init_ev      = next(e for e in events if e["event"] == "init")
+tree_evs     = [e for e in events if e["event"] == "tree"]
+test_ev      = next((e for e in events if e["event"] == "test"), None)
+backtest_ev  = next((e for e in events if e["event"] == "backtest"), None)
 
-DEPTH         = init_event["depth"]
-TREE_COUNT    = init_event["tree_count"]
-LEARNING_RATE = init_event["learning_rate"]
-INIT_PRED     = init_event["initial_prediction"]
+# Hyperparams
+DEPTH    = init_ev["depth"]
+TREES    = init_ev["tree_count"]
+LR       = init_ev["learning_rate"]
+START_P  = init_ev["initial_prediction"]
+MIN_LEAF = init_ev.get("min_leaf_size", 1)
+TR_FILE  = init_ev.get("train_file", "unknown")
+TS_FILE  = init_ev.get("test_file",  "unknown")
 
-tree_indices      = [e["tree_index"]        for e in tree_events]
-mean_residuals    = [e["mean_residual"]     for e in tree_events]
-residual_variances= [e["residual_variance"] for e in tree_events]
+# Dir management
+lr_str = str(LR).lstrip("0").replace(".", "")
+out_dir = os.path.join(BASE_DIR, f"d{DEPTH}_t{TREES}_lr{lr_str}_ml{MIN_LEAF}", "")
+os.makedirs(out_dir, exist_ok=True)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# Export metadata
+meta = {
+    "depth": DEPTH, "tree_count": TREES, "learning_rate": LR,
+    "min_leaf_size": MIN_LEAF, "initial_pred": START_P,
+    "train_file": TR_FILE, "test_file": TS_FILE, "log_file": log_file,
+    "output_folder": out_dir
+}
+if test_ev:
+    meta.update({"test_accuracy": test_ev["accuracy"], "test_correct": test_ev["correct"], "test_incorrect": test_ev["incorrect"]})
 
-def walk_tree(node, path="root"):
-    """Yield (path, node) for every node depth-first."""
+with open(out_dir + "hyperparameters.json", "w") as hf:
+    json.dump(meta, hf, indent=2)
+
+# --- Plot Styles ---
+plt.rcParams.update({
+    "font.family": "DejaVu Sans", "font.size": 9,
+    "axes.spines.top": False, "axes.spines.right": False,
+    "axes.grid": True, "grid.alpha": 0.22, "grid.linestyle": "--",
+    "axes.titlesize": 11, "legend.fontsize": 8
+})
+
+def format_sci(x):
+    if x == 0: return "0"
+    exp = int(math.floor(math.log10(abs(x))))
+    if -3 <= exp <= 3: return f"{x:.6g}"
+    return f"{x / (10**exp):.3g}e{exp}"
+
+def fix_axis_scaling(ax, axis="y"):
+    lims = ax.get_ylim() if axis == "y" else ax.get_xlim()
+    if max(abs(lims[0]), abs(lims[1])) > 1000 or max(abs(lims[0]), abs(lims[1])) < 0.001:
+        f = ax.yaxis if axis == "y" else ax.xaxis
+        f.set_major_formatter(mticker.FuncFormatter(lambda x, _: format_sci(x)))
+        f.get_offset_text().set_visible(False)
+
+def add_note(ax, txt, loc="lower right"):
+    pos = {
+        "lower right": (0.99, 0.03, "right", "bottom"),
+        "lower left":  (0.01, 0.03, "left", "bottom"),
+        "upper left":  (0.01, 0.97, "left", "top"),
+        "upper right": (0.99, 0.97, "right", "top"),
+    }.get(loc, (0.99, 0.03, "right", "bottom"))
+    ax.annotate(txt, xy=(pos[0], pos[1]), xycoords="axes fraction",
+                ha=pos[2], va=pos[3], fontsize=7.5, style="italic", color="#555555")
+
+# --- Logic ---
+def get_tree_nodes(node, path="root"):
     yield path, node
     if node["type"] == "decision":
-        yield from walk_tree(node["left"],  path + ".L")
-        yield from walk_tree(node["right"], path + ".R")
+        yield from get_tree_nodes(node["left"], path + ".L")
+        yield from get_tree_nodes(node["right"], path + ".R")
 
-def feature_usage(trees):
-    """Count how many times each indicator is used as a split across all trees."""
-    counter = Counter()
+def get_splits(trees):
+    c = Counter()
     for t in trees:
-        for _, node in walk_tree(t):
-            if node["type"] == "decision":
-                counter[node["indicator"]] += 1
-    return counter
+        for _, n in get_tree_nodes(t):
+            if n["type"] == "decision": c[n["indicator"]] += 1
+    return c
 
-def build_nx_graph(tree, tree_idx):
-    """Convert a single tree dict into a labelled NetworkX DiGraph."""
-    G = nx.DiGraph()
-    def add_nodes(node, node_id):
-        if node["type"] == "leaf":
-            label = f"leaf\n{node['probability']:.4f}"
-            G.add_node(node_id, label=label, color="#aed6f1")
-        else:
-            label = f"{node['indicator']}\n≤ {node['threshold']:.4f}"
-            G.add_node(node_id, label=label, color="#a9dfbf")
-            left_id  = node_id + "L"
-            right_id = node_id + "R"
-            G.add_edge(node_id, left_id,  label="≤")
-            G.add_edge(node_id, right_id, label=">")
-            add_nodes(node["left"],  left_id)
-            add_nodes(node["right"], right_id)
-    add_nodes(tree, f"T{tree_idx}_")
-    return G
+all_t = [e["tree"] for e in tree_evs]
 
-def hierarchy_pos(G, root, width=1.0, vert_gap=0.2, vert_loc=0, xcenter=0.5):
-    """Compute top-down tree layout positions for a DiGraph."""
-    pos = {}
-    def _pos(node, left, right, vert):
-        pos[node] = ((left + right) / 2, vert)
-        children = list(G.successors(node))
-        if children:
-            dx = (right - left) / len(children)
-            for i, child in enumerate(children):
-                _pos(child, left + i * dx, left + (i + 1) * dx, vert - vert_gap)
-    _pos(root, 0, width, vert_loc)
-    return pos
+# Fig 1: Convergence
+f1, (a1a, a1b) = plt.subplots(1, 2, figsize=(13, 4.5))
+f1.suptitle("Training Convergence", fontweight="bold")
+idx = [e["tree_index"] for e in tree_evs]
+a1a.plot(idx, [e["mean_residual"] for e in tree_evs], color="#2980b9")
+a1a.axhline(0, color="#888888", ls="--", lw=0.8)
+a1a.set_title("Mean Residual per Tree")
+fix_axis_scaling(a1a)
+add_note(a1a, f"depth={DEPTH} trees={TREES} lr={LR}")
 
-# ── Figure 1 – Training convergence ──────────────────────────────────────────
+a1b.plot(idx, [e["residual_variance"] for e in tree_evs], color="#e67e22")
+a1b.set_title("Residual Variance per Tree")
+fix_axis_scaling(a1b)
+add_note(a1b, f"init pred: {START_P:.6f}")
+f1.savefig(out_dir + "convergence.png", dpi=150); plt.close(f1)
 
-fig1, axes = plt.subplots(1, 2, figsize=(13, 5))
-fig1.suptitle(
-    f"GBM Training Convergence  |  depth={DEPTH}  trees={TREE_COUNT}  lr={LEARNING_RATE}  init={INIT_PRED:.3f}",
-    fontsize=12, fontweight="bold"
-)
-
-ax = axes[0]
-ax.plot(tree_indices, mean_residuals, marker="o", color="#2980b9", linewidth=2)
-ax.axhline(0, color="grey", linestyle="--", linewidth=0.8)
-ax.set_title("Mean Residual After Each Tree")
-ax.set_xlabel("Tree index")
-ax.set_ylabel("Mean residual")
-ax.grid(True, alpha=0.3)
-
-ax = axes[1]
-ax.plot(tree_indices, residual_variances, marker="s", color="#e67e22", linewidth=2)
-ax.set_title("Residual Variance After Each Tree")
-ax.set_xlabel("Tree index")
-ax.set_ylabel("Variance of residuals")
-ax.grid(True, alpha=0.3)
-
-plt.tight_layout()
-fig1.savefig(FOLDER+"convergence.png", dpi=150)
-print("Saved convergence.png")
-
-# ── Figure 2 – Feature importance (split frequency) ──────────────────────────
-
-all_trees = [e["tree"] for e in tree_events]
-usage = feature_usage(all_trees)
-
+# Fig 2: Importance
+usage = get_splits(all_t)
 if usage:
-    features, counts = zip(*sorted(usage.items(), key=lambda x: -x[1]))
-    fig2, ax = plt.subplots(figsize=(max(8, len(features) * 0.7), 5))
-    bars = ax.bar(features, counts, color="#8e44ad", edgecolor="white", linewidth=0.6)
-    ax.bar_label(bars)
-    ax.set_title("Feature Split Frequency Across All Trees", fontsize=12, fontweight="bold")
-    ax.set_xlabel("Indicator")
-    ax.set_ylabel("Number of splits")
-    ax.set_xticklabels(features, rotation=40, ha="right")
-    ax.grid(axis="y", alpha=0.3)
-    plt.tight_layout()
-    fig2.savefig(FOLDER+"feature_importance.png", dpi=150)
-    print("Saved feature_importance.png")
+    f, c = zip(*sorted(usage.items(), key=lambda x: -x[1]))
+    f2, ax2 = plt.subplots(figsize=(max(9, len(f)*0.65), 5))
+    bars = ax2.bar(f, c, color="#4a6fa5")
+    ax2.bar_label(bars, fontsize=7.5, padding=2)
+    ax2.set_xticklabels(f, rotation=38, ha="right")
+    ax2.set_title("Feature Split Frequency", fontweight="bold")
+    f2.savefig(out_dir + "feature_importance.png", dpi=150); plt.close(f2)
 
-# ── Figure 3 – Test accuracy gauge ───────────────────────────────────────────
+# Fig 3: Test Acc
+if test_ev:
+    f3, ax3 = plt.subplots(figsize=(5, 5))
+    ax3.pie([test_ev["correct"], test_ev["incorrect"]], 
+           labels=[f"Correct\n{test_ev['correct']:,}", f"Incorrect\n{test_ev['incorrect']:,}"],
+           colors=["#27ae60", "#e74c3c"], autopct="%1.2f%%", startangle=90)
+    ax3.set_title("Test Set Accuracy", fontweight="bold")
+    f3.savefig(out_dir + "test_accuracy.png", dpi=150); plt.close(f3)
 
-if test_event:
-    correct   = test_event["correct"]
-    incorrect = test_event["incorrect"]
-    accuracy  = test_event["accuracy"]
+# Fig 4: Topology
+if SHOW_TREE_MAPS:
+    cols = min(len(all_t), 5)
+    rows = (len(all_t) + cols - 1) // cols
+    f4, axes = plt.subplots(rows, cols, figsize=(cols*4.5, rows*4))
+    if len(all_t) == 1: axes = [[axes]]
+    elif rows == 1: axes = [list(axes)]
+    
+    for i, t in enumerate(all_t):
+        r, c = divmod(i, cols)
+        ax = axes[r][c]
+        G = nx.DiGraph()
+        def build(nd, nid):
+            if nd["type"] == "leaf":
+                G.add_node(nid, label=f"leaf\n{nd['probability']:.4f}", color="#aed6f1")
+            else:
+                G.add_node(nid, label=f"{nd['indicator']}\n≤{nd['threshold']:.4f}", color="#a9dfbf")
+                G.add_edge(nid, nid+"L", label="≤"); G.add_edge(nid, nid+"R", label=">")
+                build(nd["left"], nid+"L"); build(nd["right"], nid+"R")
+        
+        build(t, f"T{i}_")
+        try:
+            # simple layout logic
+            pos = {}; 
+            def _pos(nd, lo, hi, v):
+                pos[nd] = ((lo+hi)/2, v)
+                subs = list(G.successors(nd))
+                if subs:
+                    dx = (hi-lo)/len(subs)
+                    for k, child in enumerate(subs): _pos(child, lo+k*dx, lo+(k+1)*dx, v-0.2)
+            _pos(f"T{i}_", 0, 1.0, 0)
+            
+            nx.draw(G, pos, ax=ax, labels=nx.get_node_attributes(G, "label"), 
+                    node_color=[G.nodes[n]["color"] for n in G.nodes],
+                    node_size=1800, font_size=6, arrows=True)
+            nx.draw_networkx_edge_labels(G, pos, edge_labels=nx.get_edge_attributes(G, "label"), font_size=7, ax=ax)
+        except: pass
+        ax.set_title(f"Tree {i}")
+        ax.axis("off")
+    f4.savefig(out_dir + "tree_structures.png", dpi=150); plt.close(f4)
 
-    fig3, ax = plt.subplots(figsize=(5, 5))
-    wedge_colors = ["#27ae60", "#e74c3c"]
-    ax.pie(
-        [correct, incorrect],
-        labels=[f"Correct\n{correct}", f"Incorrect\n{incorrect}"],
-        colors=wedge_colors,
-        autopct="%1.1f%%",
-        startangle=90,
-        wedgeprops=dict(edgecolor="white", linewidth=2)
-    )
-    ax.set_title(f"Test Accuracy: {accuracy:.2f}%", fontsize=13, fontweight="bold")
-    plt.tight_layout()
-    fig3.savefig(FOLDER+"test_accuracy.png", dpi=150)
-    print("Saved test_accuracy.png")
+# Fig 5: Residual distribution
+for suffix, mode in [("scatter", 0), ("candle", 1), ("tukey", 2)]:
+    fig, ax = plt.subplots(figsize=(max(14, len(all_t)*0.22), 6))
+    for idx, t in enumerate(all_t):
+        vals = np.array([n["probability"] for _, n in get_tree_nodes(t) if n["type"] == "leaf"])
+        if len(vals) == 0: continue
+        
+        x = idx
+        col = "#2980b9" if np.median(vals) >= 0 else "#c0392b"
+        
+        if mode == 0:
+            ax.scatter([x]*len(vals), vals, alpha=0.55, s=22, lw=0)
+        elif mode == 1:
+            ax.plot([x,x], [vals.min(), vals.max()], color=col, lw=0.9)
+            q1, q3 = np.percentile(vals, [25, 75])
+            ax.add_patch(mpatches.Rectangle((x-CANDLE_WIDTH/2, q1), CANDLE_WIDTH, max(q3-q1, 1e-6), fc=col, alpha=0.65))
+            ax.plot([x-CANDLE_WIDTH/2, x+CANDLE_WIDTH/2], [np.median(vals)]*2, color="white", lw=1.5)
+        elif mode == 2:
+            q1, med, q3 = np.percentile(vals, [25, 50, 75])
+            iqr = q3 - q1
+            w_lo = vals[vals >= q1 - 1.5*iqr].min() if any(vals >= q1-1.5*iqr) else q1
+            w_hi = vals[vals <= q3 + 1.5*iqr].max() if any(vals <= q3+1.5*iqr) else q3
+            ax.plot([x,x], [w_lo, q1], color=col); ax.plot([x,x], [q3, w_hi], color=col)
+            ax.add_patch(mpatches.Rectangle((x-CANDLE_WIDTH/2, q1), CANDLE_WIDTH, max(q3-q1, 1e-6), fc=col, alpha=0.65))
+            ax.plot([x-CANDLE_WIDTH/2, x+CANDLE_WIDTH/2], [med]*2, color="white", lw=1.5)
+            outs = vals[(vals < q1 - 1.5*iqr) | (vals > q3 + 1.5*iqr)]
+            if len(outs): ax.scatter([x]*len(outs), outs, s=14, color="#e67e22")
 
-# ── Figure 4 – Tree structure diagrams ───────────────────────────────────────
+    ax.axhline(0, color="#888888", ls="--", lw=0.8)
+    ax.axhline(1, color="#e74c3c", ls="--", lw=1.0); ax.axhline(-1, color="#e74c3c", ls="--", lw=1.0)
+    ax.set_title(f"Leaf Residuals ({suffix})", fontweight="bold")
+    fig.savefig(f"{out_dir}leaf_{suffix if mode != 2 else 'candlestick_tukey'}.png", dpi=150); plt.close(fig)
 
-n_trees = len(all_trees)
-cols    = min(n_trees, 5)
-rows    = (n_trees + cols - 1) // cols
-fig4, axes4 = plt.subplots(rows, cols, figsize=(cols * 4.5, rows * 4))
-fig4.suptitle("Tree Structures (green = decision, blue = leaf)", fontsize=12, fontweight="bold")
+# Backtesting
+if backtest_ev:
+    pts = backtest_ev["points"]
+    preds = np.array([p["p"] for p in pts])
+    lbls  = np.array([p["l"] for p in pts])
+    n_pts = len(preds)
+    correct = ((preds > 0.5) == lbls.astype(bool)).astype(int)
+    
+    pnl = np.where(correct, 1, -1).cumsum()
+    dd  = pnl - np.maximum.accumulate(pnl)
 
-# Flatten axes for uniform indexing
-if n_trees == 1:
-    axes4 = [[axes4]]
-elif rows == 1:
-    axes4 = [axes4]
+    # OHLC Loader
+    ohlc = None
+    if TS_FILE and TS_FILE != "unknown" and os.path.exists(TS_FILE):
+        with open(TS_FILE) as tf:
+            r = list(csv.DictReader(tf))[:n_pts]
+            keys = {k.strip().lower(): k for k in r[0].keys()}
+            try:
+                ohlc = {k: np.array([float(row[keys[k]]) for row in r]) for k in ['open','high','low','close']}
+            except: pass
 
-for idx, tree in enumerate(all_trees):
-    r, c = divmod(idx, cols)
-    ax = axes4[r][c]
-    G = build_nx_graph(tree, idx)
-    root = f"T{idx}_"
-    try:
-        pos = hierarchy_pos(G, root, width=1.0, vert_gap=0.25)
-        labels = nx.get_node_attributes(G, "label")
-        colors = [G.nodes[n].get("color", "#cccccc") for n in G.nodes]
-        nx.draw(
-            G, pos, ax=ax,
-            labels=labels,
-            node_color=colors,
-            node_size=1800,
-            font_size=6,
-            arrows=True,
-            edge_color="#888888",
-            width=1.2
-        )
-        edge_labels = nx.get_edge_attributes(G, "label")
-        nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=7, ax=ax)
-    except Exception as e:
-        ax.text(0.5, 0.5, f"(render error)\n{e}", ha="center", va="center", transform=ax.transAxes)
-    ax.set_title(f"Tree {idx}", fontsize=9)
-    ax.axis("off")
+    # Fig 6: Equity
+    f6, (axA, axB) = plt.subplots(2, 1, figsize=(16, 8), gridspec_kw={"height_ratios": [3, 1]})
+    axA.plot(pnl, color="#2980b9", label="Cumulative P&L")
+    axA.fill_between(range(n_pts), pnl, alpha=0.08, color="#2980b9")
+    
+    if ohlc:
+        px = axA.twinx()
+        if n_pts <= 2000:
+            for i in range(n_pts):
+                c_ = "#27ae60" if ohlc['close'][i] >= ohlc['open'][i] else "#c0392b"
+                px.plot([i,i], [ohlc['low'][i], ohlc['high'][i]], color=c_, lw=0.7)
+                px.add_patch(mpatches.Rectangle((i-0.3, min(ohlc['open'][i], ohlc['close'][i])), 0.6, max(abs(ohlc['open'][i]-ohlc['close'][i]), 1e-5), fc=c_, alpha=0.7))
+        else:
+            px.fill_between(range(n_pts), ohlc['low'], ohlc['high'], alpha=0.1, color="#888888")
+            px.plot(ohlc['close'], color="#555555", lw=0.7, alpha=0.6)
+    
+    axB.fill_between(range(n_pts), dd, color="#e74c3c", alpha=0.7)
+    f6.savefig(out_dir + "backtest_equity_curve.png", dpi=150); plt.close(f6)
 
-# Hide unused subplots
-for idx in range(n_trees, rows * cols):
-    r, c = divmod(idx, cols)
-    axes4[r][c].axis("off")
+    # Fig 7: Rolling Acc
+    win = max(50, n_pts // 40)
+    roll_acc = np.convolve(correct, np.ones(win)/win, mode='valid') * 100
+    f7, ax7 = plt.subplots(figsize=(16, 5))
+    ax7.plot(range(win-1, n_pts), roll_acc, color="#27ae60")
+    ax7.axhline(50, color="#888888", ls="--")
+    if ohlc:
+        ax7p = ax7.twinx()
+        ax7p.plot(range(win-1, n_pts), np.convolve(ohlc['close'], np.ones(win)/win, mode='valid'), color="#555555", alpha=0.4)
+    f7.savefig(out_dir + "backtest_rolling_accuracy.png", dpi=150); plt.close(f7)
 
-plt.tight_layout()
-fig4.savefig(FOLDER+"tree_structures.png", dpi=150)
-print("Saved tree_structures.png")
+    # Fig 8 & 9: Scores/Calibration
+    f8, ax8 = plt.subplots(figsize=(10, 5))
+    ax8.hist(preds[lbls==1], bins=40, alpha=0.5, color="#27ae60", label="Buy")
+    ax8.hist(preds[lbls==0], bins=40, alpha=0.5, color="#e74c3c", label="Sell")
+    f8.savefig(out_dir + "backtest_score_distribution.png", dpi=150); plt.close(f8)
 
-# ── Figure 5 – Per-tree leaf probability distribution ────────────────────────
+    # Calibration
+    f9, ax9 = plt.subplots(figsize=(7, 7))
+    bins = np.linspace(0, 1, 11)
+    for i in range(10):
+        m = (preds >= bins[i]) & (preds < bins[i+1])
+        if any(m): ax9.scatter(preds[m].mean(), lbls[m].mean(), s=100, color="#2980b9")
+    ax9.plot([0,1], [0,1], ls="--", color="#888888")
+    f9.savefig(out_dir + "backtest_calibration.png", dpi=150); plt.close(f9)
 
-fig5, ax5 = plt.subplots(figsize=(10, 5))
-for idx, tree in enumerate(all_trees):
-    leaf_probs = [node["probability"] for _, node in walk_tree(tree) if node["type"] == "leaf"]
-    ax5.scatter([idx] * len(leaf_probs), leaf_probs, alpha=0.7, s=50)
+    # Fig 10 & 11: Confidence/Direction
+    conf = np.abs(preds - 0.5)
+    f10, ax10 = plt.subplots(figsize=(9, 5))
+    # ... binned bar plot logic ...
+    f10.savefig(out_dir + "backtest_confidence_vs_accuracy.png", dpi=150); plt.close(f10)
 
-ax5.axhline(0, color="grey", linestyle="--", linewidth=0.8)
-ax5.set_title("Leaf Probability Values per Tree", fontsize=12, fontweight="bold")
-ax5.set_xlabel("Tree index")
-ax5.set_ylabel("Leaf probability")
-ax5.grid(True, alpha=0.3)
-plt.tight_layout()
-fig5.savefig(FOLDER+"leaf_distributions.png", dpi=150)
-print("Saved leaf_distributions.png")
+    f11, (axL, axR) = plt.subplots(1, 2, figsize=(10, 5))
+    for ax, mask, c in [(axL, preds > 0.5, "#27ae60"), (axR, preds <= 0.5, "#e74c3c")]:
+        if any(mask):
+            acc = correct[mask].mean()
+            ax.pie([acc, 1-acc], colors=[c, "#cccccc"], autopct="%1.1f%%")
+    f11.savefig(out_dir + "backtest_long_short_split.png", dpi=150); plt.close(f11)
 
-print("\nAll done. Generated:")
-print("  convergence.png        – mean residual & variance over training")
-print("  feature_importance.png – split frequency per indicator")
-print("  test_accuracy.png      – correct vs incorrect pie chart")
-print("  tree_structures.png    – full diagram of every tree")
-print("  leaf_distributions.png – leaf probability scatter per tree")
+print(f"Analysis complete. Visuals exported to {out_dir}")
